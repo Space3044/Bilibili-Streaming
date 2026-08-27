@@ -39,8 +39,7 @@ const type = {
     BANGUMI: 'bangumi',
 }
 
-// 各类型默认连播状态(首次使用 / 未设置时采用)
-// 单视频 关闭, 分P 开启, 合集 开启, 收藏列表 关闭, 番剧 开启
+// 各类型默认连播状态(首次使用时写入):单视频/收藏列表关闭,分P/合集/番剧开启
 const DEFAULT_STATUS = {
     [type.VIDEO]: false,
     [type.MULTIPART]: true,
@@ -49,25 +48,23 @@ const DEFAULT_STATUS = {
     [type.BANGUMI]: true,
 }
 
-// 存储版本号:升级后清除旧版本按“页面当前状态”写入的残留值,统一采用新默认值
+// 存储版本号:升级时清除旧残留值,统一采用新默认值
 const STORE_VERSION = '0.6.0'
 const migrateStorage = () => {
     if (GM_getValue('__store_version') === STORE_VERSION) return
     Object.values(type).forEach((key) => GM_deleteValue(key))
     GM_setValue('__store_version', STORE_VERSION)
-    logger.log('存储已重置,应用新的默认连播设置')
+    logger.log('Startup: 存储已重置,应用默认连播设置')
 }
 
 // --- 番剧 (Bangumi) 专用逻辑 Start ---
 
-// 获取播放器内核,稳定 API:window.player.setHandoff() / getHandoff()
-// 值语义:0=自动切集, 2=播完暂停
+// 播放器内核 API:window.player.getHandoff()/setHandoff(), 0=自动切集, 2=播完暂停
 const HANDSET_AUTO = 0;
 const HANDSET_STOP = 2;
 
+// 隔离世界读不到 window.player,须经 unsafeWindow 访问页面主世界(非 Tampermonkey 回退 window)
 const getBangumiPlayer = () => {
-    // Tampermonkey 隔离世界读不到 window.player(页面主世界 JS 全局变量),
-    // 必须经 unsafeWindow 访问页面主世界;非 Tampermonkey 环境回退到 window。
     const pageWindow = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
     const player = pageWindow.player;
     return player && typeof player.getHandoff === 'function' && typeof player.setHandoff === 'function'
@@ -75,7 +72,7 @@ const getBangumiPlayer = () => {
         : null;
 };
 
-// 读取番剧当前切集状态 (通过 API,不再依赖 LocalStorage)
+// 读取番剧当前切集状态
 const getBangumiHandoff = () => {
     const player = getBangumiPlayer();
     if (!player) return HANDSET_AUTO;
@@ -87,9 +84,7 @@ const getBangumiHandoff = () => {
     }
 };
 
-// 检查番剧是否是最后一集
-// 用播放器「下一集」按钮的存在性/禁用态判定:中间集有可点的下一集按钮,最后一集按钮不存在或被禁用。
-// 不依赖 URL 形态(ep/ss)或分集列表渲染时机,避免 SS 合辑、列表未渲染时的误判。
+// 检查番剧是否为最后一集:中间集有可点的「下一集」按钮,末集按钮不存在或被禁用
 const checkBangumiLastEpisode = () => {
     const nextBtn = document.querySelector('.bpx-player-ctrl-next');
     const isLast = !nextBtn || nextBtn.classList.contains('bpx-state-disabled');
@@ -97,7 +92,7 @@ const checkBangumiLastEpisode = () => {
     return isLast;
 };
 
-// 番剧修改切集状态 (通过播放器 API,不再 DOM 模拟点击)
+// 番剧修改切集状态(通过播放器 API)
 const setBangumiHandoff = (enable) => {
     const player = getBangumiPlayer();
     if (!player) {
@@ -114,7 +109,7 @@ const setBangumiHandoff = (enable) => {
             return;
         }
         player.setHandoff(target);
-        logger.log(`Bangumi: 已通过 API 切换为 [${enable ? '自动切集' : '播完暂停'}]`);
+        logger.log(`Bangumi: 已切换为 [${enable ? '自动切集' : '播完暂停'}]`);
     } catch (e) {
         logger.error('Bangumi: setHandoff 异常', e);
     }
@@ -149,23 +144,23 @@ const handleVuePage = () => {
     const pageStatus = globalApp.continuousPlay
     let userStatus = GM_getValue(pageType)
 
-    // 首次使用:未设置时写入该类型默认值并应用
+    // 首次使用:未设置时写入默认值并应用
     if (userStatus === undefined) {
         userStatus = DEFAULT_STATUS[pageType] ?? pageStatus
         GM_setValue(pageType, userStatus)
     }
 
-    // 若实际状态与用户期望不一致,则纠正
+    // 状态与期望不一致则纠正
     if (pageStatus !== userStatus) {
         globalApp.setContinuousPlay(userStatus)
     }
 
-    logger.log(`Vue Page (${pageType}):`, {
+    logger.log(`Vue (${pageType}):`, {
         current: pageStatus,
         target: userStatus
     })
 
-    // 合集的最后一个视频不进行自动连播
+    // 合集最后一个视频不自动连播
     if (pageType === type.COLLECTION) {
         const currentBvid = globalApp.bvid
         const sections = globalApp.sectionsInfo?.sections
@@ -173,7 +168,7 @@ const handleVuePage = () => {
         if (episodes && episodes.length > 0) {
             const lastBvid = episodes[episodes.length - 1]?.bvid
             if (currentBvid === lastBvid) {
-                logger.log('Vue Page: 合集最后一个视频，强制关闭连播')
+                logger.log('Vue: 合集最后一个视频，强制关闭连播')
                 globalApp.setContinuousPlay(false)
             }
         }
@@ -185,7 +180,9 @@ const handleVuePage = () => {
 // 主入口
 const correctNextButton = () => {
     if (location.pathname.startsWith('/bangumi')) {
-        // 番剧逻辑
+        // 番剧逻辑:最后一集关连播,中间集按用户设置;返回播放器是否就绪
+        if (!getBangumiPlayer()) return false;
+
         const userWant = GM_getValue(type.BANGUMI, DEFAULT_STATUS[type.BANGUMI]);
         const isLast = checkBangumiLastEpisode();
         const finalState = isLast ? false : userWant;
@@ -193,9 +190,24 @@ const correctNextButton = () => {
         if (isLast) logger.log('Bangumi: 检测到最后一集');
 
         setBangumiHandoff(finalState);
+        return true;
     } else if (location.pathname.startsWith('/list/')) {
-        // 合集/追剧列表页:自身没有自动连播按钮,无操作
-        logger.log('List Page: 列表页无自动连播逻辑,跳过');
+        // 列表播放页(「播放全部」进入):自身无连播按钮,直接经 unsafeWindow 调播放器 API 恒开连播
+        // 返回能否拿到播放器,供轮询判断何时可以收工
+        const pageWindow = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
+        const player = pageWindow.player;
+        if (!(player && typeof player.getHandoff === 'function' && typeof player.setHandoff === 'function')) {
+            return false;
+        }
+        try {
+            if (player.getHandoff() !== HANDSET_AUTO) {
+                player.setHandoff(HANDSET_AUTO);
+                logger.log('List: 已开启自动连播');
+            }
+        } catch (e) {
+            logger.error('List: setHandoff 异常', e);
+        }
+        return true;
     } else {
         // 普通视频逻辑
         handleVuePage();
@@ -227,30 +239,32 @@ const hookVueInstance = (vueInstance) => {
 }
 
 const observeVueInstance = () => {
-    // 番剧页面:持续轮询校正连播状态(而非仅在 URL 变化时)
-    // 播放器「下一集」按钮可能晚于页面加载出现,首次执行时可能误判为最后一集;
-    // setBangumiHandoff 已有 current===target 短路,重复轮询不会重复写入。
+    // 番剧页面:每集重判最后一集(切集即 URL 变化)。轮询在播放器就绪后,仅切集时重判。
     if (location.pathname.startsWith('/bangumi')) {
-        logger.log('Bangumi Mode Activated');
+        logger.log('Bangumi: 已启动轮询');
         let lastUrl = location.href;
+        let ready = false;
         setInterval(() => {
-            if (location.href !== lastUrl) {
-                lastUrl = location.href;
-                logger.log('Bangumi: URL 变化,重新检测...');
+            if (ready) {
+                if (location.href !== lastUrl) {
+                    lastUrl = location.href;
+                    logger.log('Bangumi: URL 变化,重新检测...');
+                    correctNextButton();
+                }
+            } else {
+                ready = correctNextButton();
             }
-            correctNextButton();
         }, 2000);
         return;
     }
 
-    // 合集/追剧列表页:同样轮询 URL(用于检测进入/离开)
+    // 列表播放页:待播放器就绪并设好连播后停止轮询(连播是全局设置,切集不重置)
     if (location.pathname.startsWith('/list/')) {
-        logger.log('List Mode Activated');
-        let lastUrl = location.href;
-        setInterval(() => {
-            if (location.href !== lastUrl) {
-                lastUrl = location.href;
-                correctNextButton();
+        logger.log('List: 已启动轮询');
+        const timer = setInterval(() => {
+            if (correctNextButton()) {
+                clearInterval(timer);
+                logger.log('List: 连播已设置,停止轮询');
             }
         }, 2000);
         return;
@@ -291,7 +305,7 @@ const registerMenuCommands = () => {
     })
 }
 
-// 启动:先迁移存储(升级时重置旧残留值),再注册菜单、启动监听
+// 启动:迁移存储、注册菜单、启动监听
 migrateStorage()
 registerMenuCommands()
 observeVueInstance()
