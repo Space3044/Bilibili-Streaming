@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         矫正 b 站自动连播按钮 - 分P、合集、单视频、番剧（影片）开关分别独立
 // @namespace    http://maxchang.me
-// @version      0.3.6
+// @version      0.6.0
 // @description  关于我不想要哔哩哔哩自动连播只想在分 P 中跳转但是阿 b 把他们混为一谈这件事。
 // @author       MaxChang3
 // @match        https://www.bilibili.com/video/*
@@ -10,8 +10,9 @@
 // @icon         https://www.bilibili.com/favicon.ico
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @grant        GM_addStyle
+// @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // ==/UserScript==
 
 // 自定义 logger
@@ -38,113 +39,85 @@ const type = {
     BANGUMI: 'bangumi',
 }
 
+// 各类型默认连播状态(首次使用 / 未设置时采用)
+// 单视频 关闭, 分P 开启, 合集 开启, 收藏列表 关闭, 番剧 开启
+const DEFAULT_STATUS = {
+    [type.VIDEO]: false,
+    [type.MULTIPART]: true,
+    [type.COLLECTION]: true,
+    [type.PLAYLIST]: false,
+    [type.BANGUMI]: true,
+}
+
+// 存储版本号:升级后清除旧版本按“页面当前状态”写入的残留值,统一采用新默认值
+const STORE_VERSION = '0.6.0'
+const migrateStorage = () => {
+    if (GM_getValue('__store_version') === STORE_VERSION) return
+    Object.values(type).forEach((key) => GM_deleteValue(key))
+    GM_setValue('__store_version', STORE_VERSION)
+    logger.log('存储已重置,应用新的默认连播设置')
+}
+
 // --- 番剧 (Bangumi) 专用逻辑 Start ---
 
-// 检查番剧是否是最后一集 (纯 DOM)
-const checkBangumiLastEpisode = () => {
-    const nextBtn = document.querySelector('.bpx-player-ctrl-next');
-    if (!nextBtn) return true; // 按钮不存在，默认最后一集
-    // 检查禁用状态
-    if (nextBtn.classList.contains('bpx-state-disabled') || nextBtn.getAttribute('disabled') !== null) {
-        return true;
-    }
-    return false;
+// 获取播放器内核,稳定 API:window.player.setHandoff() / getHandoff()
+// 值语义:0=自动切集, 2=播完暂停
+const HANDSET_AUTO = 0;
+const HANDSET_STOP = 2;
+
+const getBangumiPlayer = () => {
+    // Tampermonkey 隔离世界读不到 window.player(页面主世界 JS 全局变量),
+    // 必须经 unsafeWindow 访问页面主世界;非 Tampermonkey 环境回退到 window。
+    const pageWindow = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
+    const player = pageWindow.player;
+    return player && typeof player.getHandoff === 'function' && typeof player.setHandoff === 'function'
+        ? player
+        : null;
 };
 
-// 番剧静默修改设置 (模拟点击)
-const setBangumiHandoff = (enable) => {
-    const targetVal = enable ? 0 : 2; // 0: Auto, 2: Stop
-    let needUIAction = false;
-
-    // 1. 检查 LocalStorage (作为是否需要点击的参考)
+// 读取番剧当前切集状态 (通过 API,不再依赖 LocalStorage)
+const getBangumiHandoff = () => {
+    const player = getBangumiPlayer();
+    if (!player) return HANDSET_AUTO;
     try {
-        const profile = JSON.parse(localStorage.getItem('bpx_player_profile') || '{}');
-        const currentHandoff = profile.media?.handoff;
-        if (currentHandoff !== targetVal) {
-            needUIAction = true;
-            // 尝试预先写入 LS，虽然页面不刷新可能不生效，但保持数据一致性
-            if (!profile.media) profile.media = {};
-            profile.media.handoff = targetVal;
-            localStorage.setItem('bpx_player_profile', JSON.stringify(profile));
-        }
+        return player.getHandoff();
     } catch (e) {
-        needUIAction = true;
+        logger.error('Bangumi: getHandoff 异常', e);
+        return HANDSET_AUTO;
     }
+};
 
-    if (!needUIAction) {
-        logger.log(`Bangumi: 状态已是 ${enable ? '开启' : '关闭'}，无需操作`);
+// 检查番剧是否是最后一集
+// 用播放器「下一集」按钮的存在性/禁用态判定:中间集有可点的下一集按钮,最后一集按钮不存在或被禁用。
+// 不依赖 URL 形态(ep/ss)或分集列表渲染时机,避免 SS 合辑、列表未渲染时的误判。
+const checkBangumiLastEpisode = () => {
+    const nextBtn = document.querySelector('.bpx-player-ctrl-next');
+    const isLast = !nextBtn || nextBtn.classList.contains('bpx-state-disabled');
+    if (isLast) logger.log('Bangumi: 无下一集按钮,判定为最后一集');
+    return isLast;
+};
+
+// 番剧修改切集状态 (通过播放器 API,不再 DOM 模拟点击)
+const setBangumiHandoff = (enable) => {
+    const player = getBangumiPlayer();
+    if (!player) {
+        logger.log('Bangumi: 播放器 API 不可用,跳过');
         return;
     }
 
-    // 2. 执行静默点击
-    const settingBtn = document.querySelector('.bpx-player-ctrl-setting');
-    if (!settingBtn) {
-        logger.log('Bangumi: 未找到设置按钮，无法操作');
-        return;
-    }
-
-    // 避让用户
-    const existingMenu = document.querySelector('.bpx-player-ctrl-setting-menu');
-    if (existingMenu) {
-        // 只有当鼠标真正悬停在菜单内容上，或焦点在菜单内时，才视为用户正在操作
-        // 仅仅悬停在按钮上（导致菜单显示）不视为操作，允许脚本接管
-        const isHovered = existingMenu.matches(':hover');
-        const isFocused = existingMenu.contains(document.activeElement);
-        if (isHovered || isFocused) {
-            logger.log('Bangumi: 用户正在操作菜单，跳过');
+    const target = enable ? HANDSET_AUTO : HANDSET_STOP;
+    let current;
+    try {
+        current = player.getHandoff();
+        if (current === target) {
+            logger.log(`Bangumi: 状态已是 ${enable ? '自动切集' : '播完暂停'},无需操作`);
             return;
         }
+        player.setHandoff(target);
+        logger.log(`Bangumi: 已通过 API 切换为 [${enable ? '自动切集' : '播完暂停'}]`);
+    } catch (e) {
+        logger.error('Bangumi: setHandoff 异常', e);
     }
-
-    // 注入隐藏样式
-    const styleId = 'correct-next-btn-hide-menu';
-    let styleEl = document.getElementById(styleId);
-    if (!styleEl) {
-        styleEl = document.createElement('style');
-        styleEl.id = styleId;
-        styleEl.textContent = `
-            .bpx-player-ctrl-setting-menu {
-                opacity: 0 !important;
-                visibility: hidden !important;
-                pointer-events: none !important;
-                display: block !important; 
-            }
-        `;
-        document.head.appendChild(styleEl);
-    }
-
-    // 触发菜单
-    settingBtn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-    settingBtn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-
-    setTimeout(() => {
-        const targetText = enable ? '自动切集' : '播完暂停';
-        let radioItems = document.querySelectorAll('.bpx-player-ctrl-setting-handoff .bui-radio-item');
-        if (radioItems.length === 0) {
-            radioItems = document.querySelectorAll('.bpx-player-ctrl-setting-menu .bui-radio-item');
-        }
-
-        let found = false;
-        for (const item of radioItems) {
-            const text = item.textContent?.trim();
-            if (text === targetText) {
-                found = true;
-                const input = item.querySelector('input');
-                if (input && !input.checked) {
-                    item.click();
-                    logger.log(`Bangumi: 已静默点击切换为 [${targetText}]`);
-                }
-                break;
-            }
-        }
-        if (!found) logger.log(`Bangumi: 菜单中未找到 [${targetText}]`);
-
-        // 清理
-        settingBtn.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true }));
-        setTimeout(() => {
-            if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl);
-        }, 200);
-    }, 300);
 };
 
 // --- 番剧 (Bangumi) 专用逻辑 End ---
@@ -174,12 +147,16 @@ const handleVuePage = () => {
                     : type.VIDEO
 
     const pageStatus = globalApp.continuousPlay
-    const userStatus = GM_getValue(pageType)
+    let userStatus = GM_getValue(pageType)
 
-    // 初始化或同步状态
+    // 首次使用:未设置时写入该类型默认值并应用
     if (userStatus === undefined) {
-        GM_setValue(pageType, pageStatus)
-    } else if (pageStatus !== userStatus) {
+        userStatus = DEFAULT_STATUS[pageType] ?? pageStatus
+        GM_setValue(pageType, userStatus)
+    }
+
+    // 若实际状态与用户期望不一致,则纠正
+    if (pageStatus !== userStatus) {
         globalApp.setContinuousPlay(userStatus)
     }
 
@@ -209,13 +186,16 @@ const handleVuePage = () => {
 const correctNextButton = () => {
     if (location.pathname.startsWith('/bangumi')) {
         // 番剧逻辑
-        const userWant = GM_getValue(type.BANGUMI, true);
+        const userWant = GM_getValue(type.BANGUMI, DEFAULT_STATUS[type.BANGUMI]);
         const isLast = checkBangumiLastEpisode();
         const finalState = isLast ? false : userWant;
 
         if (isLast) logger.log('Bangumi: 检测到最后一集');
 
         setBangumiHandoff(finalState);
+    } else if (location.pathname.startsWith('/list/')) {
+        // 合集/追剧列表页:自身没有自动连播按钮,无操作
+        logger.log('List Page: 列表页无自动连播逻辑,跳过');
     } else {
         // 普通视频逻辑
         handleVuePage();
@@ -247,18 +227,30 @@ const hookVueInstance = (vueInstance) => {
 }
 
 const observeVueInstance = () => {
-    // 番剧页面：轮询 URL 和 DOM
+    // 番剧页面:持续轮询校正连播状态(而非仅在 URL 变化时)
+    // 播放器「下一集」按钮可能晚于页面加载出现,首次执行时可能误判为最后一集;
+    // setBangumiHandoff 已有 current===target 短路,重复轮询不会重复写入。
     if (location.pathname.startsWith('/bangumi')) {
         logger.log('Bangumi Mode Activated');
-        // 初始延迟执行
-        setTimeout(correctNextButton, 2500);
-
         let lastUrl = location.href;
         setInterval(() => {
             if (location.href !== lastUrl) {
                 lastUrl = location.href;
-                logger.log('Bangumi: URL 变化，重新检测...');
-                setTimeout(correctNextButton, 2000);
+                logger.log('Bangumi: URL 变化,重新检测...');
+            }
+            correctNextButton();
+        }, 2000);
+        return;
+    }
+
+    // 合集/追剧列表页:同样轮询 URL(用于检测进入/离开)
+    if (location.pathname.startsWith('/list/')) {
+        logger.log('List Mode Activated');
+        let lastUrl = location.href;
+        setInterval(() => {
+            if (location.href !== lastUrl) {
+                lastUrl = location.href;
+                correctNextButton();
             }
         }, 2000);
         return;
@@ -282,8 +274,8 @@ const observeVueInstance = () => {
 const registerMenuCommands = () => {
     Object.entries(type).forEach(([key, value]) => {
         const status = GM_getValue(value)
-        // 默认为开启 (undefined or true)
-        const isEnabled = status !== false;
+        // 默认状态使用 DEFAULT_STATUS,未设置时按默认显示
+        const isEnabled = status === undefined ? DEFAULT_STATUS[value] : status;
         const statusText = isEnabled ? '✅ 开启' : '❌ 关闭'
         const typeMap = {
             [type.VIDEO]: '单视频',
@@ -299,5 +291,7 @@ const registerMenuCommands = () => {
     })
 }
 
+// 启动:先迁移存储(升级时重置旧残留值),再注册菜单、启动监听
+migrateStorage()
 registerMenuCommands()
 observeVueInstance()
